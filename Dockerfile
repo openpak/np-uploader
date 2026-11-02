@@ -11,5 +11,5 @@ LABEL org.opencontainers.image.source="https://github.com/openpak/np-uploader"
 RUN addgroup -S app && adduser -S -G app app
 USER app
 COPY --from=build /out/np-uploader /usr/local/bin/np-uploader
-EXPOSE 8533 8443
+EXPOSE 8535 8443
 ENTRYPOINT ["/usr/local/bin/np-uploader"]

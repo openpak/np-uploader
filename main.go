@@ -60,5 +60,5 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	return nphttp.Run(ctx, mux, nphttp.Env("NP_HTTP_ADDR", ":8533"), os.Getenv("NP_TLS_ADDR"), front)
+	return nphttp.Run(ctx, mux, nphttp.Env("NP_HTTP_ADDR", ":8535"), os.Getenv("NP_TLS_ADDR"), front)
 }
