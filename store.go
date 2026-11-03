@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
-	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	pb "openpak/np-uploader/internal/titlestoragepb"
 )
 
 // Object is one uploaded attachment.
@@ -40,140 +45,102 @@ type Store interface {
 	Get(ctx context.Context, ref string) (Object, error)
 	// Delete removes ref when owned by owner.
 	Delete(ctx context.Context, owner, ref string) error
-	// List returns the owner's objects (Body left empty, Size in len via Size field), oldest first.
+	// List returns the owner's objects (Body left empty, Size set), oldest first.
 	List(ctx context.Context, owner string) ([]Object, error)
 }
 
-type MemStore struct {
-	mu sync.Mutex
-	m  map[string]Object
+// The attachments live in the neutral title-storage core under a reserved neutral title key (no
+// network: the key is not a PS3 communication id), collection "attachments", named by the
+// reference, owned by the uploader. Rows are public in the core because the reference is the
+// capability and this service applies the account core's interaction check on download; the quota
+// (MaxPerOwner bytes, MaxItems objects, MaxObject per body) is the title's policy there.
+const (
+	titleKey   = "np-messages"
+	collection = "attachments"
+)
+
+// CoreStore keeps attachments in the title-storage service.
+type CoreStore struct{ C pb.TitleStorageClient }
+
+// DialStorage connects to the neutral title-storage service (gRPC) and presents the internal
+// key on every call. extra lets tests add a dialer.
+func DialStorage(addr, key string, extra ...grpc.DialOption) (pb.TitleStorageClient, *grpc.ClientConn, error) {
+	opts := append([]grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, inv grpc.UnaryInvoker, o ...grpc.CallOption) error {
+			return inv(metadata.AppendToOutgoingContext(ctx, "x-internal-key", key), method, req, reply, cc, o...)
+		}),
+	}, extra...)
+	conn, err := grpc.NewClient(addr, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pb.NewTitleStorageClient(conn), conn, nil
 }
 
-func (s *MemStore) Put(_ context.Context, o Object) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.m == nil {
-		s.m = map[string]Object{}
-	}
-	n, total := 0, 0
-	for _, x := range s.m {
-		if x.Owner == o.Owner {
-			n++
-			total += len(x.Body)
-		}
-	}
-	if n >= MaxItems || total+len(o.Body) > MaxPerOwner {
-		return ErrFull
-	}
-	s.m[o.Ref] = o
-	return nil
-}
+var titleRef = &pb.TitleRef{Title: titleKey}
 
-func (s *MemStore) Get(_ context.Context, ref string) (Object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if o, ok := s.m[ref]; ok {
-		return o, nil
-	}
-	return Object{}, ErrNotFound
-}
-
-func (s *MemStore) Delete(_ context.Context, owner, ref string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if o, ok := s.m[ref]; !ok || o.Owner != owner {
-		return ErrNotFound
-	}
-	delete(s.m, ref)
-	return nil
-}
-
-func (s *MemStore) List(_ context.Context, owner string) ([]Object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []Object
-	for _, o := range s.m {
-		if o.Owner == owner {
-			o.Size, o.Body = len(o.Body), nil
-			out = append(out, o)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Date.Before(out[j].Date) || out[i].Date.Equal(out[j].Date) && out[i].Ref < out[j].Ref
-	})
-	return out, nil
-}
-
-type PGStore struct{ DB *pgxpool.Pool }
-
-func (s *PGStore) Migrate(ctx context.Context) error {
-	_, err := s.DB.Exec(ctx, `
-	CREATE TABLE IF NOT EXISTS uploader_data (
-		ref         text        PRIMARY KEY,
-		owner       text        NOT NULL,
-		owner_jid   text        NOT NULL,
-		application text        NOT NULL,
-		quota       text        NOT NULL,
-		date        timestamptz NOT NULL,
-		body        bytea       NOT NULL);
-	CREATE INDEX IF NOT EXISTS uploader_data_owner ON uploader_data (owner)`)
+// Sync declares the reserved title and its limits to the core. Put works without it (the core's
+// defaults apply), so a core that is down at start only delays the stricter limits.
+func (s *CoreStore) Sync(ctx context.Context) error {
+	_, err := s.C.UpsertTitle(ctx, &pb.UpsertTitleRequest{Title: titleKey, Name: "PS3 message attachments", QuotaBytes: MaxPerOwner,
+		QuotaObjects: MaxItems, MaxObjectBytes: MaxObject, DefaultVisibility: pb.Visibility_VISIBILITY_PUBLIC})
 	return err
 }
 
-func (s *PGStore) Put(ctx context.Context, o Object) error {
-	tx, err := s.DB.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, o.Owner); err != nil {
-		return err
-	}
-	var n, total int64
-	if err = tx.QueryRow(ctx, `SELECT count(*), coalesce(sum(length(body)),0) FROM uploader_data WHERE owner = $1`, o.Owner).Scan(&n, &total); err != nil {
-		return err
-	}
-	if n >= MaxItems || total+int64(len(o.Body)) > MaxPerOwner {
+type meta struct {
+	JID         string `json:"jid"`
+	Application string `json:"application"`
+	Quota       string `json:"quota"`
+}
+
+func fromCore(o *pb.Object) Object {
+	var m meta
+	_ = json.Unmarshal([]byte(o.MetaJson), &m)
+	return Object{Ref: o.Name, Owner: o.Owner, OwnerJID: m.JID, Application: m.Application, Quota: m.Quota,
+		Date: time.UnixMilli(o.CreatedUnixMs).UTC(), Body: o.Body, Size: int(o.Size)}
+}
+
+func (s *CoreStore) Put(ctx context.Context, o Object) error {
+	mj, _ := json.Marshal(meta{o.OwnerJID, o.Application, o.Quota})
+	_, err := s.C.PutObject(ctx, &pb.PutObjectRequest{Ref: titleRef, Owner: o.Owner, Writer: o.Owner, Setter: o.OwnerJID, Collection: collection,
+		Name: o.Ref, MetaJson: string(mj), Body: o.Body, Visibility: pb.Visibility_VISIBILITY_PUBLIC})
+	if status.Code(err) == codes.ResourceExhausted {
 		return ErrFull
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO uploader_data VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		o.Ref, o.Owner, o.OwnerJID, o.Application, o.Quota, o.Date, o.Body); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return err
 }
 
-func (s *PGStore) Get(ctx context.Context, ref string) (Object, error) {
-	o := Object{Ref: ref}
-	err := s.DB.QueryRow(ctx, `SELECT owner, owner_jid, application, quota, date, body FROM uploader_data WHERE ref = $1`, ref).
-		Scan(&o.Owner, &o.OwnerJID, &o.Application, &o.Quota, &o.Date, &o.Body)
-	if errors.Is(err, pgx.ErrNoRows) {
+func (s *CoreStore) Get(ctx context.Context, ref string) (Object, error) {
+	// No owner: the reference is unguessable and names the object across owners.
+	r, err := s.C.GetObject(ctx, &pb.GetObjectRequest{Ref: titleRef, Collection: collection, Name: ref, IncludeBody: true})
+	if err != nil {
+		return Object{}, err
+	}
+	if !r.Found {
 		return Object{}, ErrNotFound
 	}
-	return o, err
+	return fromCore(r.Object), nil
 }
 
-func (s *PGStore) Delete(ctx context.Context, owner, ref string) error {
-	t, err := s.DB.Exec(ctx, `DELETE FROM uploader_data WHERE owner = $1 AND ref = $2`, owner, ref)
-	if err == nil && t.RowsAffected() == 0 {
+func (s *CoreStore) Delete(ctx context.Context, owner, ref string) error {
+	r, err := s.C.DeleteObjects(ctx, &pb.DeleteObjectsRequest{Ref: titleRef, Owner: owner, Writer: owner, Collection: collection, Names: []string{ref}})
+	if err == nil && r.Deleted == 0 {
 		err = ErrNotFound
 	}
 	return err
 }
 
-func (s *PGStore) List(ctx context.Context, owner string) ([]Object, error) {
-	rows, err := s.DB.Query(ctx, `SELECT ref, owner_jid, application, quota, date, length(body) FROM uploader_data WHERE owner = $1 ORDER BY date, ref`, owner)
+func (s *CoreStore) List(ctx context.Context, owner string) ([]Object, error) {
+	r, err := s.C.ListObjects(ctx, &pb.ListObjectsRequest{Ref: titleRef, Viewer: owner, Owners: []string{owner}, Collection: collection,
+		Sort: "created", Ascending: true, Limit: 1000})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []Object
-	for rows.Next() {
-		o := Object{Owner: owner}
-		if err := rows.Scan(&o.Ref, &o.OwnerJID, &o.Application, &o.Quota, &o.Date, &o.Size); err != nil {
-			return nil, err
-		}
-		out = append(out, o)
+	out := make([]Object, 0, len(r.Objects))
+	for _, o := range r.Objects {
+		out = append(out, fromCore(o))
 	}
-	return out, rows.Err()
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Date.Before(out[j].Date) })
+	return out, nil
 }

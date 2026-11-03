@@ -15,7 +15,7 @@ Request body: `<uploader platform="ps3" sv="..."><ticket>base64 NP ticket</ticke
 Result codes reuse the TUS set: `02` bad ticket, `06` not allowed, `07` internal, `1a` too large or owner over quota, `4a` no such
 data, `ff` malformed. Replies are always HTTP 200 with `Content-Length`.
 
-Limits (OpenPak's choice): 1 MiB per attachment, 16 MiB and 200 attachments per account. The owner downloads and deletes; anyone the
+Limits (OpenPak's choice, enforced by the title-storage core as the `np-messages` policy): 1 MiB per attachment, 16 MiB and 200 attachments per account. The owner downloads and deletes; anyone the
 core allows to interact with the owner (no block either way) may download by reference. No expiry yet.
 
 Request shape: recovered from VSH (`FUN_00204230`, `FUN_002045c4`). Reply field names: recovered from the firmware parsers. Result codes,

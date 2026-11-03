@@ -13,8 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/jackc/pgx/v5/pgxpool"
+	"time"
 )
 
 func main() {
@@ -26,24 +25,39 @@ func main() {
 
 func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	dbURL := os.Getenv("NP_UPLOADER_DATABASE_URL")
-	if dbURL == "" {
-		return fmt.Errorf("NP_UPLOADER_DATABASE_URL must be set")
+	tsAddr, tsKey := os.Getenv("NP_TITLE_STORAGE_ADDR"), os.Getenv("NP_TITLE_STORAGE_KEY")
+	if tsAddr == "" || tsKey == "" {
+		return fmt.Errorf("NP_TITLE_STORAGE_ADDR and NP_TITLE_STORAGE_KEY must be set")
 	}
 	if len(os.Getenv("NP_CORE_KEY")) < 32 {
 		return fmt.Errorf("NP_CORE_KEY must be at least 32 bytes")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := pgxpool.New(ctx, dbURL)
+	storage, storageConn, err := DialStorage(tsAddr, tsKey)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	store := &PGStore{DB: pool}
-	if err := store.Migrate(ctx); err != nil {
-		return err
-	}
+	defer storageConn.Close()
+	store := &CoreStore{C: storage}
+	// Declare the reserved title's limits to the core; Put works with the core's defaults until
+	// this succeeds, so a core that is down at start only delays the stricter limits.
+	go func() {
+		for {
+			c, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := store.Sync(c)
+			cancel()
+			if err == nil {
+				return
+			}
+			log.Warn("title-storage policy sync", "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+		}
+	}()
 	core, err := coreclient.Dial(nphttp.Env("NP_CORE_ADDR", "localhost:7000"), os.Getenv("NP_CORE_KEY"))
 	if err != nil {
 		return err

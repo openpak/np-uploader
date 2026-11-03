@@ -19,6 +19,7 @@ import (
 	"openpak/np-common/fakecore"
 	"openpak/np-common/identity"
 	"openpak/np-common/ticket"
+	"openpak/np-uploader/internal/fakestorage"
 )
 
 const commid = "NPWR01234_00"
@@ -27,6 +28,24 @@ type user struct {
 	id  string
 	raw []byte
 	jid string
+}
+
+const storageKey = "test-storage-key"
+
+// newStore is a CoreStore on an in-process title-storage fake, with the policy declared as main does.
+func newStore(t *testing.T) (*CoreStore, *fakestorage.Fake) {
+	t.Helper()
+	fs := fakestorage.New(storageKey)
+	c, conn, err := DialStorage("passthrough:///storage", storageKey, fs.Serve(t)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	s := &CoreStore{C: c}
+	if err := s.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return s, fs
 }
 
 func setup(t *testing.T, store Store) (*httptest.Server, map[string]user) {
@@ -64,6 +83,11 @@ func setup(t *testing.T, store Store) (*httptest.Server, map[string]user) {
 	return srv, users
 }
 
+func newCoreStore(t *testing.T) *CoreStore {
+	s, _ := newStore(t)
+	return s
+}
+
 func call_(t *testing.T, srv *httptest.Server, op string, u user, inner string, data []byte) string {
 	t.Helper()
 	body := `<?xml version="1.0" encoding="utf-8"?><uploader platform="ps3" sv="4.93"><ticket>` + base64.StdEncoding.EncodeToString(u.raw) +
@@ -85,7 +109,7 @@ func call_(t *testing.T, srv *httptest.Server, op string, u user, inner string, 
 }
 
 func TestUploadDownloadDelete(t *testing.T) {
-	srv, u := setup(t, &MemStore{})
+	srv, u := setup(t, newCoreStore(t))
 	payload := []byte("\x00\x01binary\r\n\r\ndata")
 	up := `<quota>game</quota><application>` + commid + `</application><size>` + strconv.Itoa(len(payload)) + `</size>`
 	r := call_(t, srv, "upload_data", u["alice"], up, payload)
@@ -122,7 +146,7 @@ func TestUploadDownloadDelete(t *testing.T) {
 }
 
 func TestUploadValidation(t *testing.T) {
-	srv, u := setup(t, &MemStore{})
+	srv, u := setup(t, newCoreStore(t))
 	bad := u["alice"]
 	bad.raw = []byte("AAAA")
 	for name, c := range map[string]struct {
@@ -149,8 +173,11 @@ func TestUploadValidation(t *testing.T) {
 }
 
 func TestOwnerQuota(t *testing.T) {
-	s := &MemStore{}
+	s, fs := newStore(t)
 	ctx := context.Background()
+	if p := fs.Policy(titleKey); p == nil || p.QuotaBytes != MaxPerOwner || p.QuotaObjects != MaxItems || p.MaxObjectBytes != MaxObject {
+		t.Fatalf("policy not declared: %+v", p)
+	}
 	for i := 0; i < MaxItems; i++ {
 		if err := s.Put(ctx, Object{Ref: strconv.Itoa(i), Owner: "a", Body: []byte("x")}); err != nil {
 			t.Fatal(err)
@@ -159,13 +186,19 @@ func TestOwnerQuota(t *testing.T) {
 	if err := s.Put(ctx, Object{Ref: "over", Owner: "a", Body: []byte("x")}); err != ErrFull {
 		t.Fatal("item cap not enforced:", err)
 	}
-	if err := s.Put(ctx, Object{Ref: "other", Owner: "b", Body: make([]byte, MaxPerOwner+1)}); err != ErrFull {
+	// The cap is per owner, and the byte cap trips on a fresh owner's second large body.
+	for i := 0; i < 16; i++ {
+		if err := s.Put(ctx, Object{Ref: "big" + strconv.Itoa(i), Owner: "b", Body: make([]byte, MaxObject)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Put(ctx, Object{Ref: "big-over", Owner: "b", Body: []byte("x")}); err != ErrFull {
 		t.Fatal("byte cap not enforced:", err)
 	}
 }
 
 func TestListAndQuota(t *testing.T) {
-	srv, u := setup(t, &MemStore{})
+	srv, u := setup(t, newCoreStore(t))
 	for _, p := range []struct{ q, body string }{{"game", "aaa"}, {"sys", "bbbbb"}} {
 		call_(t, srv, "upload_data", u["alice"], `<quota>`+p.q+`</quota><application>`+commid+`</application><size>`+strconv.Itoa(len(p.body))+`</size>`, []byte(p.body))
 	}
