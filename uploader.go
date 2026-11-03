@@ -60,11 +60,54 @@ func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /uploader/sec/upload_data", s.handle(s.upload))
 	mux.HandleFunc("POST /uploader/sec/download_data", s.handle(s.download))
 	mux.HandleFunc("POST /uploader/sec/delete_data", s.handle(s.remove))
-	// Reply shapes of these two were not recovered from the firmware; answer an explicit error
-	// instead of leaving the console waiting.
-	for _, op := range []string{"get_data_list", "get_quota"} {
-		mux.HandleFunc("POST /uploader/sec/"+op, s.handle(func(c *call) { reply(c.w, resultUnspecified, "", nil) }))
+	// VSH 4.93 builds URLs for get_data_list and get_quota (op 0x12, 0x13) but has no request
+	// builder or reply parser for them, so no shipped client sends these. The shapes below are
+	// ours (see lists), modelled on the download header fields; they cannot disagree with a client.
+	mux.HandleFunc("POST /uploader/sec/get_data_list", s.handle(s.list))
+	mux.HandleFunc("POST /uploader/sec/get_quota", s.handle(s.quota))
+}
+
+// list answers the caller's own objects, optionally narrowed by <quota> and <application>:
+//
+//	<uploader result="00"><total>N</total><data><reference/><quota/><application/><size/><date/></data>...</uploader>
+func (s *Service) list(c *call) {
+	objs, err := s.Store.List(c.r.Context(), c.actor.AccountID)
+	if err != nil {
+		s.Log.Warn("uploader store", "err", err)
+		reply(c.w, resultInternal, "", nil)
+		return
 	}
+	var b strings.Builder
+	n := 0
+	for _, o := range objs {
+		if c.req.Quota != "" && o.Quota != c.req.Quota || c.req.Application != "" && o.Application != c.req.Application {
+			continue
+		}
+		n++
+		b.WriteString(`<data><reference>` + o.Ref + `</reference><quota>` + o.Quota + `</quota><application>` + o.Application +
+			`</application><size>` + strconv.Itoa(o.Size) + `</size><date>` + o.Date.Format(dateFmt) + `</date></data>`)
+	}
+	reply(c.w, resultOK, `<total>`+strconv.Itoa(n)+`</total>`+b.String(), nil)
+}
+
+// quota answers the caller's usage against the per-account limits:
+//
+//	<uploader result="00"><quotasize>MaxPerOwner</quotasize><totalsize>used</totalsize><total>items</total><max>MaxItems</max></uploader>
+//
+// (quotasize and totalsize are the names the firmware uses for its other storage-info reply.)
+func (s *Service) quota(c *call) {
+	objs, err := s.Store.List(c.r.Context(), c.actor.AccountID)
+	if err != nil {
+		s.Log.Warn("uploader store", "err", err)
+		reply(c.w, resultInternal, "", nil)
+		return
+	}
+	used := 0
+	for _, o := range objs {
+		used += o.Size
+	}
+	reply(c.w, resultOK, `<quotasize>`+strconv.Itoa(MaxPerOwner)+`</quotasize><totalsize>`+strconv.Itoa(used)+
+		`</totalsize><total>`+strconv.Itoa(len(objs))+`</total><max>`+strconv.Itoa(MaxItems)+`</max>`, nil)
 }
 
 type request struct {

@@ -10,7 +10,7 @@ Request body: `<uploader platform="ps3" sv="..."><ticket>base64 NP ticket</ticke
 | `/uploader/sec/upload_data` | `quota` (game, sys, premo, premo2), `application` (communication ID), `size` (must equal the byte count) | `<uploader result="00"><reference>32 hex</reference></uploader>` |
 | `/uploader/sec/download_data` | `reference` | `<uploader result="00"><jid/><quota/><application/><size/><date/></uploader>` then `\r\n\r\n` and the bytes |
 | `/uploader/sec/delete_data` | `reference` | `<uploader result="00"/>` |
-| `/uploader/sec/get_data_list`, `get_quota` | | `result="ff"`: reply shapes unknown |
+| `/uploader/sec/get_data_list`, `get_quota` | caller's own objects (optional `<quota>`/`<application>` filter); usage and limits | VSH 4.93 never calls these (URLs exist, no request builder or parser), so the reply shapes are OpenPak's own: `list` returns `<total>` and `<data><reference/><quota/><application/><size/><date/></data>` per object, `quota` returns `<quotasize>`, `<totalsize>`, `<total>`, `<max>` |
 
 Result codes reuse the TUS set: `02` bad ticket, `06` not allowed, `07` internal, `1a` too large or owner over quota, `4a` no such
 data, `ff` malformed. Replies are always HTTP 200 with `Content-Length`.

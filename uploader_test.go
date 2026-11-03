@@ -163,3 +163,25 @@ func TestOwnerQuota(t *testing.T) {
 		t.Fatal("byte cap not enforced:", err)
 	}
 }
+
+func TestListAndQuota(t *testing.T) {
+	srv, u := setup(t, &MemStore{})
+	for _, p := range []struct{ q, body string }{{"game", "aaa"}, {"sys", "bbbbb"}} {
+		call_(t, srv, "upload_data", u["alice"], `<quota>`+p.q+`</quota><application>`+commid+`</application><size>`+strconv.Itoa(len(p.body))+`</size>`, []byte(p.body))
+	}
+	r := call_(t, srv, "get_data_list", u["alice"], ``, nil)
+	if !strings.Contains(r, `result="00"`) || !strings.Contains(r, `<total>2</total>`) || strings.Count(r, "<data>") != 2 || !strings.Contains(r, `<size>5</size>`) {
+		t.Fatal(r)
+	}
+	r = call_(t, srv, "get_data_list", u["alice"], `<quota>sys</quota>`, nil)
+	if !strings.Contains(r, `<total>1</total>`) || strings.Count(r, "<data>") != 1 {
+		t.Fatal(r)
+	}
+	if r = call_(t, srv, "get_data_list", u["bob"], ``, nil); !strings.Contains(r, `<total>0</total>`) {
+		t.Fatal(r)
+	}
+	r = call_(t, srv, "get_quota", u["alice"], ``, nil)
+	if !strings.Contains(r, `<totalsize>8</totalsize>`) || !strings.Contains(r, `<total>2</total>`) || !strings.Contains(r, `<quotasize>`+strconv.Itoa(MaxPerOwner)+`</quotasize>`) {
+		t.Fatal(r)
+	}
+}

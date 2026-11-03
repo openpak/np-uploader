@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ type Object struct {
 	Quota       string // game | sys | premo | premo2
 	Date        time.Time
 	Body        []byte
+	Size        int // set by List, where Body is not loaded
 }
 
 var (
@@ -38,6 +40,8 @@ type Store interface {
 	Get(ctx context.Context, ref string) (Object, error)
 	// Delete removes ref when owned by owner.
 	Delete(ctx context.Context, owner, ref string) error
+	// List returns the owner's objects (Body left empty, Size in len via Size field), oldest first.
+	List(ctx context.Context, owner string) ([]Object, error)
 }
 
 type MemStore struct {
@@ -82,6 +86,22 @@ func (s *MemStore) Delete(_ context.Context, owner, ref string) error {
 	}
 	delete(s.m, ref)
 	return nil
+}
+
+func (s *MemStore) List(_ context.Context, owner string) ([]Object, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Object
+	for _, o := range s.m {
+		if o.Owner == owner {
+			o.Size, o.Body = len(o.Body), nil
+			out = append(out, o)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Date.Before(out[j].Date) || out[i].Date.Equal(out[j].Date) && out[i].Ref < out[j].Ref
+	})
+	return out, nil
 }
 
 type PGStore struct{ DB *pgxpool.Pool }
@@ -139,4 +159,21 @@ func (s *PGStore) Delete(ctx context.Context, owner, ref string) error {
 		err = ErrNotFound
 	}
 	return err
+}
+
+func (s *PGStore) List(ctx context.Context, owner string) ([]Object, error) {
+	rows, err := s.DB.Query(ctx, `SELECT ref, owner_jid, application, quota, date, length(body) FROM uploader_data WHERE owner = $1 ORDER BY date, ref`, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Object
+	for rows.Next() {
+		o := Object{Owner: owner}
+		if err := rows.Scan(&o.Ref, &o.OwnerJID, &o.Application, &o.Quota, &o.Date, &o.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }
